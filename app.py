@@ -1,13 +1,123 @@
 import streamlit as st
 import uuid
 import requests
+import html
+from audio_recorder_streamlit import audio_recorder
 
 BACKEND_URL = "http://localhost:8000"
 
 st.set_page_config(page_title="AI Mock Interview - Velira", page_icon="🤖")
 
+# ============================================================
+# VISUAL THEME
+# Palette: ink #1B1F23, paper #FAFAF8, teal #0F6E6E, mist #E7EEEC, coral #E8535B
+# Display font: Space Grotesk (headings, labels) — body stays Streamlit's default
+# Signature element: the stage stepper below, which mirrors the real state machine
+# ============================================================
+CUSTOM_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
+
+h1, h2, h3, .stepper .step-label {
+    font-family: 'Space Grotesk', sans-serif !important;
+}
+
+h1 { letter-spacing: -0.01em; }
+
+/* ── Stage stepper ───────────────────────────────────────── */
+.stepper {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin: 0.5rem 0 1.75rem 0;
+}
+.step { display: flex; flex-direction: column; align-items: center; flex: 0 0 auto; }
+.step .dot {
+    width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid #E7EEEC; background: #FAFAF8;
+    margin-top: 4px;
+}
+.step.done .dot { background: #0F6E6E; border-color: #0F6E6E; }
+.step.current .dot {
+    background: #FAFAF8; border-color: #0F6E6E;
+    box-shadow: 0 0 0 4px rgba(15, 110, 110, 0.15);
+}
+.step .step-label {
+    font-size: 0.7rem; margin-top: 6px; color: #1B1F23; opacity: 0.5;
+    text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap;
+}
+.step.current .step-label, .step.done .step-label { opacity: 1; font-weight: 700; }
+.stepper-line { flex: 1 1 auto; height: 2px; background: #E7EEEC; margin: 12px 4px 0 4px; }
+.stepper-line.done { background: #0F6E6E; }
+
+/* ── Chat bubbles ─────────────────────────────────────────── */
+.bubble-row { display: flex; margin: 0.35rem 0; }
+.velira-row { justify-content: flex-start; }
+.candidate-row { justify-content: flex-end; }
+.bubble-label {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em;
+    opacity: 0.6; margin-bottom: 0.2rem;
+}
+.velira-bubble {
+    background: #E7EEEC; border-radius: 14px 14px 14px 2px;
+    padding: 0.7rem 1rem; max-width: 80%; line-height: 1.45;
+}
+.velira-bubble.flagged {
+    background: rgba(232, 83, 91, 0.10);
+    border: 1px solid rgba(232, 83, 91, 0.4);
+}
+.candidate-bubble {
+    background: #0F6E6E; color: #FAFAF8; border-radius: 14px 14px 2px 14px;
+    padding: 0.7rem 1rem; max-width: 80%; line-height: 1.45;
+}
+.candidate-bubble .bubble-label { color: #FAFAF8; opacity: 0.75; }
+
+/* ── Buttons ──────────────────────────────────────────────── */
+.stButton > button {
+    border-radius: 8px;
+    font-weight: 600;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+def render_stepper(current_state: str, complete: bool):
+    """Renders the interview's 5 stages as a horizontal progress stepper."""
+    stages = ["warmup", "technical", "probing", "wrapup", "completed"]
+    labels = {
+        "warmup": "Warm-up",
+        "technical": "Technical",
+        "probing": "Probing",
+        "wrapup": "Wrap-up",
+        "completed": "Complete",
+    }
+    effective_state = "completed" if complete else current_state
+    current_index = stages.index(effective_state) if effective_state in stages else 0
+
+    parts = ['<div class="stepper">']
+    for i, stage in enumerate(stages):
+        if i < current_index or (complete and i <= current_index):
+            step_class = "step done"
+        elif i == current_index:
+            step_class = "step current"
+        else:
+            step_class = "step pending"
+        parts.append(f'<div class="{step_class}"><div class="dot"></div><div class="step-label">{labels[stage]}</div></div>')
+        if i < len(stages) - 1:
+            line_class = "stepper-line done" if i < current_index else "stepper-line"
+            parts.append(f'<div class="{line_class}"></div>')
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def escape_for_bubble(text: str) -> str:
+    """Escapes HTML special characters and preserves line breaks for chat bubbles."""
+    return html.escape(text).replace("\n", "<br>")
+
+
 st.title("🤖💻 AI Mock Interview Simulator")
-st.caption("Step 7: Manual form OR resume upload, full loop, feedback, right-aligned End Early.")
 
 # Keep a stable session_id for this browser session
 if "session_id" not in st.session_state:
@@ -17,7 +127,7 @@ if "session_id" not in st.session_state:
 if "interview_started" not in st.session_state:
     st.session_state.interview_started = False
 
-st.write(f"**Session ID:** `{st.session_state.session_id}`")
+st.caption(f"Session ID: {st.session_state.session_id}")
 
 if not st.session_state.interview_started:
     entry_mode = st.radio(
@@ -35,7 +145,7 @@ if entry_mode == "Fill form manually":
     with st.form("profile_form"):
         st.subheader("Candidate Profile")
 
-        candidate_name = st.text_input("Full Name", placeholder="e.g. Shristi Sharma")
+        candidate_name = st.text_input("Full Name", placeholder="e.g. Shrishti")
 
         domain = st.text_input("Domain / Target Role", placeholder="e.g. Data Science, Backend Development")
 
@@ -69,9 +179,9 @@ if entry_mode == "Fill form manually":
 
         col3, col4 = st.columns(2)
         with col3:
-            company_type = st.selectbox("Company Style", ["General", "Startup", "FAANG"])
+            company_type = st.selectbox("Company Style", ["General", "Startup"])
         with col4:
-            interview_tone = st.selectbox("Interview Tone", ["Friendly", "Direct", "Stressful"])
+            interview_tone = st.selectbox("Interview Tone", ["Friendly", "Direct", "Strict"])
 
         submitted = st.form_submit_button("Save Profile")
 
@@ -215,18 +325,26 @@ if entry_mode == "Upload resume (PDF)":
 # ============================================================
 if st.session_state.interview_started:
     st.divider()
-    stage_label = "completed" if st.session_state.get("interview_complete") else st.session_state.get("current_state", "warmup")
-    st.subheader(f"Stage: {stage_label}")
+    render_stepper(
+        st.session_state.get("current_state", "warmup"),
+        st.session_state.get("interview_complete", False),
+    )
 
     transcript = st.session_state.get("transcript", [])
 
-    # Render the full conversation so far
+    # Render the full conversation so far, as chat bubbles
     for i, turn in enumerate(transcript):
         is_last = (i == len(transcript) - 1)
         if turn["role"] == "velira":
-            label = "**Velira:**" if not turn.get("flagged") else "**Velira (guardrail):**"
-            st.write(label)
-            st.write(turn["text"])
+            flagged = turn.get("flagged", False)
+            bubble_class = "velira-bubble flagged" if flagged else "velira-bubble"
+            label = "Velira · guardrail" if flagged else "Velira"
+            st.markdown(
+                f'<div class="bubble-row velira-row"><div class="{bubble_class}">'
+                f'<div class="bubble-label">{label}</div>{escape_for_bubble(turn["text"])}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
             # Only fetch/play audio for the most recent Velira message,
             # to avoid re-downloading every clip on every rerun
             if is_last and turn.get("audio"):
@@ -236,12 +354,55 @@ if st.session_state.interview_started:
                 else:
                     st.warning("Could not load audio for this message.")
         else:
-            st.write("**You:**")
-            st.write(turn["text"])
-        st.write("")
+            st.markdown(
+                f'<div class="bubble-row candidate-row"><div class="candidate-bubble">'
+                f'<div class="bubble-label">You</div>{escape_for_bubble(turn["text"])}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.write("")
 
     # ── Candidate reply form (only while interview is still running) ──────
     if not st.session_state.get("interview_complete"):
+
+        # ── Voice input: record, transcribe via /transcribe, fill answer box ──
+        st.write("**Speak your answer** (optional — or just type below)")
+        audio_bytes = audio_recorder(
+            text="",
+            recording_color="#e8535b",
+            neutral_color="#6c757d",
+            icon_size="2x",
+            key="answer_recorder",
+        )
+
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/wav")
+            if st.button("Use this recording as my answer"):
+                with st.spinner("Transcribing..."):
+                    try:
+                        stt_response = requests.post(
+                            f"{BACKEND_URL}/transcribe",
+                            files={"audio": ("recording.wav", audio_bytes, "audio/wav")},
+                            timeout=60,
+                        )
+                    except requests.exceptions.ConnectionError:
+                        st.error(
+                            "Could not reach the backend at "
+                            f"{BACKEND_URL}. Make sure the backend is still running."
+                        )
+                        stt_response = None
+
+                if stt_response is not None:
+                    if stt_response.status_code == 200:
+                        transcript = stt_response.json().get("transcript", "")
+                        # Pre-fill the answer box below with the transcribed text
+                        st.session_state["candidate_answer_input"] = transcript
+                        st.success(f"Transcribed: {transcript}")
+                        st.rerun()
+                    else:
+                        st.error(f"Backend error ({stt_response.status_code}): {stt_response.text}")
+
         with st.form("reply_form", clear_on_submit=True):
             candidate_answer = st.text_area("Your answer", key="candidate_answer_input")
             send = st.form_submit_button("Send Answer")
