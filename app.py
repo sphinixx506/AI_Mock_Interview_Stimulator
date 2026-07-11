@@ -2,6 +2,7 @@ import streamlit as st
 import uuid
 import requests
 import html
+import base64
 from audio_recorder_streamlit import audio_recorder
 
 BACKEND_URL = "http://localhost:8000"
@@ -117,6 +118,17 @@ def escape_for_bubble(text: str) -> str:
     return html.escape(text).replace("\n", "<br>")
 
 
+def autoplay_audio(audio_bytes: bytes):
+    """Plays audio immediately on render, with visible controls to pause/replay."""
+    b64 = base64.b64encode(audio_bytes).decode()
+    st.markdown(
+        f'<audio autoplay controls style="width: 100%; margin-top: 4px;">'
+        f'<source src="data:audio/mp3;base64,{b64}" type="audio/mp3">'
+        f'</audio>',
+        unsafe_allow_html=True,
+    )
+
+
 st.title("🤖💻 AI Mock Interview Simulator")
 
 # Keep a stable session_id for this browser session
@@ -145,7 +157,7 @@ if entry_mode == "Fill form manually":
     with st.form("profile_form"):
         st.subheader("Candidate Profile")
 
-        candidate_name = st.text_input("Full Name", placeholder="e.g. Shrishti")
+        candidate_name = st.text_input("Full Name", placeholder="e.g. Shristi Sharma")
 
         domain = st.text_input("Domain / Target Role", placeholder="e.g. Data Science, Backend Development")
 
@@ -179,9 +191,9 @@ if entry_mode == "Fill form manually":
 
         col3, col4 = st.columns(2)
         with col3:
-            company_type = st.selectbox("Company Style", ["General", "Startup"])
+            company_type = st.selectbox("Company Style", ["General", "Startup", "FAANG"])
         with col4:
-            interview_tone = st.selectbox("Interview Tone", ["Friendly", "Direct", "Strict"])
+            interview_tone = st.selectbox("Interview Tone", ["Friendly", "Direct", "Stressful"])
 
         submitted = st.form_submit_button("Save Profile")
 
@@ -350,7 +362,7 @@ if st.session_state.interview_started:
             if is_last and turn.get("audio"):
                 audio_response = requests.get(f"{BACKEND_URL}/audio/{turn['audio']}")
                 if audio_response.status_code == 200:
-                    st.audio(audio_response.content, format="audio/mp3")
+                    autoplay_audio(audio_response.content)
                 else:
                     st.warning("Could not load audio for this message.")
         else:
@@ -373,7 +385,7 @@ if st.session_state.interview_started:
             recording_color="#e8535b",
             neutral_color="#6c757d",
             icon_size="2x",
-            key="answer_recorder",
+            key=f"answer_recorder_{len(transcript)}",
         )
 
         if audio_bytes:
@@ -541,7 +553,7 @@ if st.session_state.interview_started:
             if feedback_audio:
                 audio_response = requests.get(f"{BACKEND_URL}/audio/{feedback_audio}")
                 if audio_response.status_code == 200:
-                    st.audio(audio_response.content, format="audio/mp3")
+                    autoplay_audio(audio_response.content)
 
             with st.expander("Raw session data (for debugging / handoff)"):
                 st.json(st.session_state.get("db_payload", {}))
