@@ -11,10 +11,51 @@ from dotenv import load_dotenv
 from google import genai
 from gtts import gTTS
 import whisper
+import time
 os.environ["PATH"] += os.pathsep + r"C:\ProgramData\chocolatey\bin"
 
 load_dotenv()
 print(f"--- DEBUG: API Key found: {os.environ.get('GEMINI_API_KEY')} ---")
+
+class GeminiClientWithFallback:
+    """Wraps two Gemini clients. Tries the primary key first; if it hits a
+    quota/rate-limit error and a secondary key is configured, retries once
+    on the secondary key. Exposes the same .models.generate_content()
+    interface as a normal genai.Client(), so no other code needs to change.
+    """
+    def __init__(self, primary_key, secondary_key=None):
+        self._primary = genai.Client(api_key=primary_key)
+        self._secondary = genai.Client(api_key=secondary_key) if secondary_key else None
+
+    class _Models:
+        def __init__(self, outer):
+            self._outer = outer
+
+        def generate_content(self, **kwargs):
+            try:
+                return self._outer._primary.models.generate_content(**kwargs)
+            except Exception as e:
+                error_str = str(e)
+                is_quota_error = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                if is_quota_error and self._outer._secondary is not None:
+                    print("--- PRIMARY GEMINI KEY EXHAUSTED — SWITCHING TO SECONDARY KEY ---")
+                    return self._outer._secondary.models.generate_content(**kwargs)
+                raise
+
+    @property
+    def models(self):
+        return self._Models(self)
+
+
+try:
+    ai_client = GeminiClientWithFallback(
+        primary_key=os.environ.get("GEMINI_API_KEY"),
+        secondary_key=os.environ.get("GEMINI_API_KEY_2"),
+    )
+except Exception as e:
+    raise RuntimeError(f"Initialization Error: {e}")
+
+GEMINI_MODEL = "gemini-3.5-flash"
 
 app = FastAPI(
     title="AI Mock Interview - Core Engine",
@@ -29,15 +70,11 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-try:
-    ai_client = genai.Client()
-except Exception as e:
-    raise RuntimeError(f"Initialization Error: {e}")
+#try:
+    #ai_client = genai.Client()
+#except Exception as e:
+    #raise RuntimeError(f"Initialization Error: {e}")
 
-try:
-    ai_client = genai.Client()
-except Exception as e:
-    raise RuntimeError(f"Initialization Error: {e}")
 
 # Load Whisper once at startup
 print("--- Loading Whisper model... ---")
@@ -151,7 +188,7 @@ async def classify_input(candidate_answer: str) -> str:
     prompt = GUARDRAIL_PROMPT.format(candidate_answer=candidate_answer)
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         classification = response.text.strip().upper()
@@ -182,7 +219,7 @@ async def validate_response(velira_response: str) -> bool:
     prompt = RESPONSE_GUARDRAIL_PROMPT.format(velira_response=velira_response)
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         result = response.text.strip().upper()
@@ -397,7 +434,7 @@ async def start_interview(payload: StartInterviewRequest):
     )
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=persona_prompt,
         )
         first_question = response.text
@@ -424,6 +461,7 @@ async def start_interview(payload: StartInterviewRequest):
         return {
             "success": True,
             "session_id": payload.session_id,
+            "candidate_name": payload.candidate_name,
             "interviewer": "Velira",
             "message": first_question,
             "audio_file": audio_file
@@ -495,50 +533,77 @@ async def candidate_reply(payload: CandidateReplyRequest):
     new_state, transitioned = check_and_transition(session)
 
     # ── 7. Build conversation and call Gemini ─────────────────────────────
+    #state_instruction = STATE_INSTRUCTIONS[new_state]
+    #conversation = f"{state_instruction}\n\n"
     state_instruction = STATE_INSTRUCTIONS[new_state]
-    conversation = f"{state_instruction}\n\n"
+    name_reminder = (
+        "\nIMPORTANT: Do not use the candidate's name in this response. "
+        "Only use their name in the very first greeting and the very final "
+        "message of the whole interview — nowhere else.\n"
+    )
+    conversation = f"{state_instruction}{name_reminder}\n\n"
     conversation += "\n\n".join(
         f"{msg['role'].upper()}: {msg['parts'][0]}"
         for msg in session["history"]
     )
 
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=conversation,
-        )
-        next_message = response.text
+    
+    MAX_RETRIES = 3
+    RETRY_DELAY_SECONDS = 2
+    next_message = None
 
-        # ── 8. Guardrail — validate Velira's response ─────────────────────
-        is_safe = await validate_response(next_message)
-        print(f"--- GUARDRAIL: Velira response is {'SAFE' if is_safe else 'UNSAFE'} ---")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = ai_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=conversation,
+            )
+            next_message = response.text
+            break  # success, stop retrying
+        except Exception as e:
+            error_str = str(e)
+            is_transient = "503" in error_str or "UNAVAILABLE" in error_str
+            print(f"--- GEMINI ATTEMPT {attempt} FAILED: {error_str} ---")
 
-        if not is_safe:
-            next_message = GUARDRAIL_RESPONSES["UNSAFE_RESPONSE"]
+            if is_transient and attempt < MAX_RETRIES:
+                print(f"--- RETRYING IN {RETRY_DELAY_SECONDS}s... ---")
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gemini API Error after {attempt} attempt(s): {error_str}"
+                )
 
-        # ── 9. Append Velira's response to history ────────────────────────
-        session["history"].append({
-            "role": "model",
-            "parts": [next_message]
-        })
+    # ── 8. Guardrail — validate Velira's response ─────────────────────
+    is_safe = await validate_response(next_message)
+    print(f"--- GUARDRAIL: Velira response is {'SAFE' if is_safe else 'UNSAFE'} ---")
 
-        # ── 10. Generate TTS ──────────────────────────────────────────────
-        audio_file = text_to_speech(next_message)
+    if not is_safe:
+        next_message = GUARDRAIL_RESPONSES["UNSAFE_RESPONSE"]
 
-        return {
-            "success": True,
-            "session_id": payload.session_id,
-            "message": next_message,
-            "audio_file": audio_file,
-            "current_state": new_state,
-            "question_number": session["total_questions"],
-            "stage_changed": transitioned,
-            "flagged": False,
-        }
+    # ── 9. Append Velira's response to history ────────────────────────
+    session["history"].append({
+        "role": "model",
+        "parts": [next_message]
+    })
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
+    # ── 10. Generate TTS ──────────────────────────────────────────────
+    audio_file = text_to_speech(next_message)
 
+    return {
+        "success": True,
+        "session_id": payload.session_id,
+        "message": next_message,
+        "audio_file": audio_file,
+        "current_state": new_state,
+        "question_number": session["total_questions"],
+        "stage_changed": transitioned,
+        "flagged": False,
+    }
+    
+
+    
 
 @app.get("/audio/{filename}")
 async def get_audio(filename: str):
@@ -557,7 +622,7 @@ async def generate_interview_questions(payload: InterviewSetupRequest):
     """
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         return {"success": True, "questions": response.text}
@@ -685,7 +750,7 @@ Rules:
         # ── 6. Call Gemini for feedback ───────────────────────────────────
         print(f"--- CALLING GEMINI FOR FEEDBACK ---")
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=feedback_prompt,
         )
         feedback_text = response.text
@@ -812,7 +877,7 @@ async def upload_resume_and_start(
 
         # Step C: Call your existing Gemini client with JSON forcing flag
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=extraction_prompt,
             config={"response_mime_type": "application/json"}
         )
