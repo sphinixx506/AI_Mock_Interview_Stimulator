@@ -12,6 +12,7 @@ from google import genai
 from gtts import gTTS
 import whisper
 import time
+import re
 os.environ["PATH"] += os.pathsep + r"C:\ProgramData\chocolatey\bin"
 
 load_dotenv()
@@ -162,9 +163,24 @@ def close_session(session_id: str) -> dict:
 # SECTION 3 — TTS
 # ============================================================
 
+# def text_to_speech(text: str):
+#     filename = f"audio_{uuid.uuid4().hex}.mp3"
+#     tts = gTTS(text=text, lang='en', slow=False)
+#     tts.save(filename)
+#     return filename
+def clean_text_for_speech(text: str) -> str:
+    """Strips markdown/formatting characters gTTS would otherwise read
+    aloud literally (backticks, asterisks, underscores, hashes, quotes)."""
+    cleaned = re.sub(r'[`*_#]', '', text)
+    cleaned = re.sub(r'["\']', '', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
 def text_to_speech(text: str):
     filename = f"audio_{uuid.uuid4().hex}.mp3"
-    tts = gTTS(text=text, lang='en', slow=False)
+    speech_text = clean_text_for_speech(text)
+    tts = gTTS(text=speech_text, lang='en', slow=False)
     tts.save(filename)
     return filename
 
@@ -307,6 +323,7 @@ YOUR STRICT RULES:
 - If no projects are listed, never ask about projects under any circumstances
 - Use the candidate's name sparingly — only once at the start and once at the end, not in every message
 - Never break character — you are Velira, not an AI
+- Never pronounce the punctuation symbols
 
 EDGE CASE HANDLING:
 - If candidate says "I don't know": encourage gently and move on
